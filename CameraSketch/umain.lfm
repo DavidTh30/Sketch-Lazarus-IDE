@@ -1,0 +1,12 @@
+object MainForm: TMainForm
+  Left = 160
+  Height = 820
+  Top = 90
+  Width = 1360
+  Caption = 'LZ-1 Camera Sketch'
+  KeyPreview = True
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  OnKeyDown = FormKeyDown
+  Position = poScreenCenter
+end
