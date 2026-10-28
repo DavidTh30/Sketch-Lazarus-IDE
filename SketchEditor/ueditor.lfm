@@ -1,0 +1,13 @@
+object EditorForm: TEditorForm
+  Left = 80
+  Height = 900
+  Top = 60
+  Width = 1560
+  Caption = 'LZ Sketch Editor'
+  KeyPreview = True
+  OnCloseQuery = FormCloseQuery
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  OnKeyDown = FormKeyDown
+  Position = poScreenCenter
+end
