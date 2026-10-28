@@ -26,6 +26,7 @@ unit URenderPool;
 interface
 
 uses
+  {$IFDEF WINDOWS}Windows,{$ENDIF}
   Classes, SysUtils, Math, Graphics, BGRABitmap, BGRABitmapTypes, USketchScene;
 
 const
@@ -57,6 +58,7 @@ type
     FTmp: array[1..128] of array of TPointF;   // scratch polygons by point count, no allocation per prim
     FCov: array of integer;                    // coverage row for FillSolidAA
     FBands: integer;
+    FBusyMs: double;                           // time spent drawing in the last job
     FRows: array[0..BandH - 1] of PBGRAPixel;  // band row pointers
     FBandW, FBandRows, FBandY0: integer;
     procedure PencilLine(X1, Y1, X2, Y2: single; C: TBGRAPixel; W: single);
@@ -90,7 +92,7 @@ type
     FTexRows: array[0..TexCount - 1, 0..TexSize - 1] of PBGRAPixel;   // read only, shared
     FDecal: array[0..DecalCount - 1] of TBGRABitmap;
     FOverlay: array of TOverlay;
-    FOverlayCount: integer;
+    FOverlayCount, FLastOverlay: integer;
     procedure Run(AJob: TJobKind; ATiles: integer);
     procedure MakeTextures;
     function GetThreadCount: integer;
@@ -106,6 +108,11 @@ type
     procedure AddRect(X0, Y0, X1, Y1: single; C: TBGRAPixel; W: single);
     procedure AddSprite(X, Y: integer; S: TBGRABitmap; Opacity: byte);
     property ThreadCount: integer read GetThreadCount;
+    function WorkerBands(i: integer): integer;
+    function WorkerBusyMs(i: integer): double;
+    function OverlayCount: integer;
+  public
+    PlainPaper: boolean;             // layer "Paper texture" off
   end;
 
 const
@@ -142,6 +149,21 @@ begin
   c := (Hash2(ix, iy + 1) and $FFFF) / 65535;
   d := (Hash2(ix + 1, iy + 1) and $FFFF) / 65535;
   Result := (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
+end;
+
+function TickMs: double;
+{$IFDEF WINDOWS}
+var
+  C, F: int64;
+{$ENDIF}
+begin
+  {$IFDEF WINDOWS}
+  QueryPerformanceCounter(C);
+  QueryPerformanceFrequency(F);
+  Result := double(C) * 1000 / F;     // not C * 1000.0: that is computed in single precision
+  {$ELSE}
+  Result := GetTickCount64;
+  {$ENDIF}
 end;
 
 procedure BlendPixel(Px: PBGRAPixel; const C: TBGRAPixel; A: integer); inline;
@@ -184,12 +206,14 @@ end;
 procedure TRenderWorker.Execute;
 var
   Tile: integer;
+  T0: double;
 begin
   while True do
   begin
     RTLEventWaitFor(FStart);
     if Terminated then Break;
     FBands := 0;
+    T0 := TickMs;
     repeat
       Tile := InterlockedIncrement(FPool.FNextTile) - 1;
       if Tile >= FPool.FTiles then Break;
@@ -200,6 +224,7 @@ begin
       end;
       Inc(FBands);
     until False;
+    FBusyMs := TickMs - T0;
     RTLEventSetEvent(FDone);
   end;
 end;
@@ -566,8 +591,11 @@ begin
   FBandRows := Rows;
   FBandY0 := Y0;
   for y := 0 to BandH - 1 do FRows[y] := FBand.ScanLine[y];
-  for y := 0 to Rows - 1 do
-    Move(FPool.FPaper.ScanLine[Y0 + y]^, FRows[y]^, W * SizeOf(TBGRAPixel));
+  if FPool.PlainPaper then
+    for y := 0 to Rows - 1 do FillDWord(FRows[y]^, W, DWord(BGRA(PaperR, PaperG, PaperB, 255)))
+  else
+    for y := 0 to Rows - 1 do
+      Move(FPool.FPaper.ScanLine[Y0 + y]^, FRows[y]^, W * SizeOf(TBGRAPixel));
   FBand.InvalidateBitmap;
 
   Scene := FPool.FScene;
@@ -575,6 +603,7 @@ begin
   begin
     P := Scene.Prims[i];
     if (P^.Y1 < Y0) or (P^.Y0 > Y0 + Rows) then Continue;
+    if not Scene.LayerOn[P^.Kind] then Continue;
     DrawPrim(P, -Y0);
   end;
 
@@ -666,6 +695,21 @@ begin
   inherited Destroy;
 end;
 
+function TRenderPool.WorkerBands(i: integer): integer;
+begin
+  Result := FWorkers[i].FBands;
+end;
+
+function TRenderPool.WorkerBusyMs(i: integer): double;
+begin
+  Result := FWorkers[i].FBusyMs;
+end;
+
+function TRenderPool.OverlayCount: integer;
+begin
+  Result := FLastOverlay;
+end;
+
 function TRenderPool.GetThreadCount: integer;
 begin
   Result := Length(FWorkers);
@@ -690,6 +734,7 @@ begin
   FFlash := AFlash;
   Run(jkFrame, (AFrame.Height + BandH - 1) div BandH);
   AFrame.InvalidateBitmap;
+  FLastOverlay := FOverlayCount;
   FOverlayCount := 0;
 end;
 
@@ -768,10 +813,11 @@ var
     else Result := 0;
   end;
 
-  procedure MakeDecal(Index: integer; const AText: string; AW, AH, ASize: integer; Bold: boolean);
+  procedure MakeDecal(Index: integer; const AText: string; AW, AH, ASize: integer; Bold: boolean;
+    const AFont: string = 'Bahnschrift');
   begin
     FDecal[Index] := TBGRABitmap.Create(AW, AH, BGRAPixelTransparent);
-    FDecal[Index].FontName := 'Bahnschrift';
+    FDecal[Index].FontName := AFont;
     FDecal[Index].FontHeight := ASize;
     if Bold then FDecal[Index].FontStyle := [fsBold];
     FDecal[Index].FontQuality := fqFineAntialiasing;
@@ -792,13 +838,13 @@ begin
         v := 0.75 + 0.25 * Sin(2 * Pi * (x - y) / TexSize * 2) * Cos(2 * Pi * (x + 2 * y) / TexSize);
         dark := ((Hash2(x * 13 + i, y * 7) and 255) / 255 - 0.5) * 6;
         case i of
-          TexPaper:   dark := dark * 0.6;
+          TexPaper:   dark := dark * 0.6 + 9 + 14 * v * Diag(x - y, 8);
           TexLight:   dark := dark + 55 * v * Diag(x + y, 8);
-          TexMid:     dark := dark + 70 * v * Diag(x + y, 4) + 10;
-          TexDark:    dark := dark + 75 * v * Diag(x + y, 4) + 60 * v * Diag(x - y, 4) + 25;
-          TexRubber:  dark := dark * 2.5 + 70 * v * Diag(x + y, 4) + 60 * Diag(x - y, 4) + 70;
-          TexGlass:   dark := dark + 165 + 30 * Diag(x - y, 4);
-          TexLeather: dark := dark * 3 + 35 + 45 * Ord(Hash2(x, y * 3 + 1) and 7 = 0) + 25 * Diag(x + y, 8);
+          TexMid:     dark := dark + 55 * v * Diag(x + y, 4) + 8;
+          TexDark:    dark := dark + 60 * v * Diag(x + y, 4) + 42 * v * Diag(x - y, 4) + 16;
+          TexRubber:  dark := dark * 2.5 + 60 * v * Diag(x + y, 4) + 45 * Diag(x - y, 4) + 45;
+          TexGlass:   dark := dark + 62 + 28 * v * Diag(x - y, 4) + 12 * Diag(x + y, 8);
+          TexLeather: dark := dark * 4 + 48 + 55 * Ord(Hash2(x, y * 3 + 1) and 3 = 0) + 20 * Diag(x + y, 8);
         end;
         Px^.red := EnsureRange(Round(PaperR - 4 - dark), 0, 255);
         Px^.green := EnsureRange(Round(PaperG - 4 - dark), 0, 255);
@@ -809,7 +855,7 @@ begin
     end;
     FTex[i].InvalidateBitmap;
   end;
-  MakeDecal(DecalBrand, 'LAZRA', 320, 110, 84, True);
+  MakeDecal(DecalBrand, 'Lazra', 420, 80, 58, True, 'Georgia');
   MakeDecal(DecalModel, 'LZ-1', 160, 64, 40, False);
 end;
 

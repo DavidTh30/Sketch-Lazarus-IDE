@@ -16,7 +16,10 @@ unit UMain;
   Mouse: drag = orbit, wheel = lens zoom 24-70 mm, Ctrl+wheel or right drag = distance.
   Keys:  Space shutter, E explode, W x-ray, A auto orbit, L labels, R redraw,
          V vsync, [ ] shutter speed, Up/Down ISO, Left/Right aperture,
-         F11 fullscreen, Esc leave fullscreen. }
+         F11 fullscreen, Esc leave fullscreen, F12 developer window (udevform.pas).
+
+  Command line: --shot <file.png> <seconds> [explode|x] [threads] [yaw] [pitch]
+                --devtest <folder>   drive the developer window and exports, then quit }
 
 {$mode objfpc}{$H+}
 
@@ -25,10 +28,15 @@ interface
 uses
   {$IFDEF WINDOWS}Windows, MMSystem,{$ENDIF}
   Classes, SysUtils, Math, Forms, Controls, Graphics, ExtCtrls, LCLType, GL, OpenGLContext,
-  BGRABitmap, BGRABitmapTypes, USketchScene, URenderPool;
+  Process, BGRABitmap, BGRABitmapTypes, USketchScene, URenderPool, UAudio, UExport;
 
 type
-  TButtonId = (bShutter, bExplode, bWire, bOrbit, bLabels, bRedraw, bVSync);
+  TButtonId = (bShutter, bExplode, bWire, bOrbit, bLabels, bRedraw, bVSync, bDev);
+
+const
+  HistLen = 240;                     // frames kept for the developer graphs
+
+type
 
   THudButton = record
     R: TRectF;
@@ -42,7 +50,7 @@ type
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure FormKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
-  private
+  public
     FGL: TOpenGLControl;
     FView: TPaintBox;
     FOutput: TControl;
@@ -73,6 +81,43 @@ type
     FOldState: TWindowState;
     FShotFlash: single;
     FLastShots: integer;
+
+    // developer window
+    Dev: TForm;
+    Audio: TAudio;
+    HoverObj: integer;               // object list row under the mouse: part, or 100 + layer
+    ShowHud, ShowFlash: boolean;
+    GLVendor, GLRenderer, GLVersion: string;
+    HistFrame, HistCpu, HistRaster: array[0..HistLen - 1] of single;
+    HistPos: integer;
+    FPrevFrameT: double;
+    // still capture, done on the next frame
+    FCapPath: string;
+    FCapScale: integer;
+    FCapHud: boolean;
+    // recording
+    Recording: boolean;
+    FRecMp4: boolean;
+    FRecFrames: TFPList;
+    FRecWriter: TFfmpegWriter;
+    FRecPath: string;
+    FRecFps, FRecW, FRecH: integer;
+    FRecHud: boolean;
+    FRecStart, FRecEnd, FRecNext: double;
+
+    procedure RequestStill(const Path: string; Scale: integer; WithHud: boolean);
+    procedure StartRecording(Mp4: boolean; Seconds, Fps: integer; Scale: single; WithHud: boolean;
+      const FfmpegHint: string);
+    procedure StopRecording;
+    function RecordStatus: string;
+    procedure CaptureFrames;
+    function ReproCommand: string;
+    procedure DrawHover;
+    procedure ToggleDev;
+    procedure DevTestStep;
+  public
+    FTestStep: integer;
+    FTestT: double;
 
     function NowMs: double;
     procedure AppIdle(Sender: TObject; var Done: boolean);
@@ -106,6 +151,9 @@ var
   MainForm: TMainForm;
 
 implementation
+
+uses
+  ULog, UDevForm;
 
 {$R *.lfm}
 
@@ -192,8 +240,22 @@ begin
   FButtons[bLabels].Caption := 'LABELS';    FButtons[bLabels].Key := 'L';
   FButtons[bRedraw].Caption := 'REDRAW';    FButtons[bRedraw].Key := 'R';
   FButtons[bVSync].Caption := 'VSYNC';      FButtons[bVSync].Key := 'V';
+  FButtons[bDev].Caption := 'DEV';          FButtons[bDev].Key := 'F12';
+
+  Audio := TAudio.Create;
+  HoverObj := -1;
+  ShowHud := True;
+  ShowFlash := True;
+  LogFmt('app', 'start: %d render threads, refresh %d Hz, swap interval %d, %s',
+    [FPool.ThreadCount, FRefreshHz, FSwapInterval, BoolToStr(FUseGL, 'OpenGL', 'GDI')]);
 
   if (ParamStr(1) = '--shot') and (ParamStr(4) = 'explode') then FScene.ExplodeOn := True;
+  if (ParamStr(1) = '--shot') and (ParamStr(6) <> '') then
+  begin
+    FScene.Yaw := StrToFloatDef(ParamStr(6), FScene.Yaw);
+    FScene.Pitch := StrToFloatDef(ParamStr(7), FScene.Pitch);
+    FScene.AutoOrbit := False;
+  end;
 
   FLastTick := NowMs;
   FNextFrame := FLastTick;
@@ -207,6 +269,8 @@ begin
   {$IFDEF WINDOWS}
   timeEndPeriod(1);
   {$ENDIF}
+  if Recording then StopRecording;
+  Audio.Free;
   FPool.Free;
   FScene.Free;
   FFrame.Free;
@@ -223,7 +287,9 @@ var
 begin
   {$IFDEF WINDOWS}
   QueryPerformanceCounter(C);
-  Result := C * 1000.0 / FFreq;
+  // double(C): with a bare 1000.0 (a single constant) FPC computes this in single precision,
+  // which rounds the timestamp to 64 ms steps after a few days of uptime
+  Result := double(C) * 1000 / FFreq;
   {$ELSE}
   Result := GetTickCount64;
   {$ENDIF}
@@ -271,12 +337,22 @@ end;
 
 procedure TMainForm.DoFrame;
 var
-  T0, T1, T2, T3: double;
+  T0, T1, T2, T3, Fl: double;
   W, H: integer;
+  NoHud: boolean;
 begin
   T0 := NowMs;
   FScene.Update(Min(0.05, (T0 - FLastTick) / 1000));
   FLastTick := T0;
+  // sounds raised by the animation
+  if FScene.SoundEvents and seAutofocus <> 0 then Audio.Play(sndAutofocus);
+  if FScene.SoundEvents and seShutter <> 0 then
+  begin
+    Audio.Play(sndShutter);
+    LogFmt('camera', 'exposure No. %d at %s f/%s ISO %d %d mm', [FScene.Shots, ShutterNames[FScene.ShutterIdx],
+      FormatFloat('0.#', FStops[FScene.ApertureIdx]), IsoValues[FScene.IsoIdx], FScene.FocalMm]);
+  end;
+  FScene.SoundEvents := 0;
   if FScene.Shots <> FLastShots then
   begin
     FLastShots := FScene.Shots;
@@ -286,6 +362,12 @@ begin
 
   W := Max(64, FOutput.Width);
   H := Max(64, FOutput.Height);
+  if (FCapPath <> '') and (FCapScale > 1) then
+  begin
+    // high resolution still: this one frame is drawn bigger (GL just shows it scaled down)
+    W := W * FCapScale;
+    H := H * FCapScale;
+  end;
   EnsurePaper(W, H);
   if (FFrame.Width <> W) or (FFrame.Height <> H) then FFrame.SetSize(W, H);
   LayoutButtons;
@@ -293,10 +375,14 @@ begin
   FScene.Build(W, H);
   T1 := NowMs;
   DrawLabels;
-  DrawHud;
+  NoHud := not ShowHud or ((FCapPath <> '') and not FCapHud) or (Recording and not FRecHud);
+  if not NoHud then DrawHud;
+  if (HoverObj >= 0) and (FCapPath = '') and not Recording then DrawHover;
   T2 := NowMs;
-  FPool.RenderFrame(FFrame, FPaper, FScene, FScene.Flash);
+  if ShowFlash then Fl := FScene.Flash else Fl := 0;
+  FPool.RenderFrame(FFrame, FPaper, FScene, Fl);
   T3 := NowMs;
+  CaptureFrames;
   FBuildMs := FBuildMs * 0.9 + (T1 - T0) * 0.1;
   FHudMs := FHudMs * 0.9 + (T2 - T1) * 0.1;
   FRasterMs := FRasterMs * 0.9 + (T3 - T2) * 0.1;
@@ -311,6 +397,7 @@ begin
     try
       Add(Format('fps=%.1f cpu=%.2f build=%.2f raster=%.2f hud=%.2f wait=%.2f threads=%d prims=%d',
         [FFps, FCpuMs, FBuildMs, FRasterMs, FHudMs, FWaitMs, FPool.ThreadCount, FScene.Count]));
+      Add(LogTail(300));
       SaveToFile(ChangeFileExt(ParamStr(2), '.txt'));
     finally
       Free;
@@ -318,10 +405,22 @@ begin
     Application.Terminate;
   end;
 
+  if ParamStr(1) = '--devtest' then DevTestStep;
+
+  // history for the developer graphs
+  HistFrame[HistPos] := T0 - FPrevFrameT;
+  HistCpu[HistPos] := NowMs - T0 - FWaitMs;
+  HistRaster[HistPos] := T3 - T2;
+  HistPos := (HistPos + 1) mod HistLen;
+  if (FPrevFrameT > 0) and (T0 - FPrevFrameT > 50) and (FScene.Time > 0.5) then
+    LogFmt('perf', 'slow frame: %.1f ms since the previous one', [T0 - FPrevFrameT]);
+  FPrevFrameT := T0;
+
   Inc(FFrames);
   if T0 - FFpsTime >= 500 then
   begin
     FFps := FFrames * 1000 / (T0 - FFpsTime);
+    if Trunc(T0 / 2000) <> Trunc(FFpsTime / 2000) then LogFmt('perf', 'fps %.1f', [FFps]);
     FFrames := 0;
     FStats[0] := FormatFloat('0.0', FFps);
     FStats[1] := FormatFloat('0.00', FCpuMs);
@@ -344,15 +443,11 @@ begin
   FPaper.SetSize(W, H);
   FPool.BuildPaper(FPaper);           // grain on all cores
   DrawPaperSheet;                     // border, zones, title block lines
+  LogFmt('view', 'frame size %dx%d', [W, H]);
 end;
 
 // Drawing-sheet furniture that never changes: frame, zone marks, title block grid.
 procedure TMainForm.DrawPaperSheet;
-const
-  Captions: array[0..2, 0..3] of string = (
-    ('FPS', 'CPU MS', 'RASTER MS', 'THREADS'),
-    ('PRIMS', 'BUILD MS', 'HUD MS', 'SIZE'),
-    ('OUTPUT', '', 'SHOTS', 'FOCAL'));
 var
   W, H, i, n: integer;
   X, Y, TX, TY: single;
@@ -392,25 +487,6 @@ begin
       FPaper.TextOut(Margin - 3, Y, Chr(Ord('A') + i), InkSoft, taCenter);
       FPaper.TextOut(W - Margin + 3, Y, Chr(Ord('A') + i), InkSoft, taCenter);
     end;
-  end;
-  // title block, bottom right
-  TX := W - Margin - TitleW;
-  TY := H - Margin - TitleH;
-  FPaper.FillRectAntialias(TX, TY, W - Margin, H - Margin, BGRA(246, 244, 237, 255));
-  FPaper.RectangleAntialias(TX, TY, W - Margin, H - Margin, Ink, 1.4);
-  FPaper.DrawLineAntialias(TX, TY + 34, W - Margin, TY + 34, Ink, 1);
-  FPaper.DrawLineAntialias(TX, TY + 62, W - Margin, TY + 62, InkSoft, 0.8);
-  FPaper.DrawLineAntialias(TX, TY + 90, W - Margin, TY + 90, InkSoft, 0.8);
-  for i := 1 to 3 do
-    FPaper.DrawLineAntialias(TX + TitleW * i / 4, TY + 34, TX + TitleW * i / 4, H - Margin, InkSoft, 0.8);
-  FPaper.FontHeight := 9;
-  FPaper.TextOut(TX + 6, TY + 3, 'TITLE', InkSoft);
-  FPaper.TextOut(W - Margin - 6, TY + 3, 'DWG NO. LZ-1-001', InkSoft, taRightJustify);
-  for i := 0 to 3 do
-  begin
-    FPaper.TextOut(TX + TitleW * i / 4 + 5, TY + 36, Captions[0, i], InkSoft);
-    FPaper.TextOut(TX + TitleW * i / 4 + 5, TY + 64, Captions[1, i], InkSoft);
-    FPaper.TextOut(TX + TitleW * i / 4 + 5, TY + 92, Captions[2, i], InkSoft);
   end;
   FPaper.InvalidateBitmap;
 end;
@@ -476,6 +552,11 @@ begin
   for i := 0 to FScene.LabelCount - 1 do
   begin
     L := FScene.Labels[i];
+    case L.Kind of
+      lkDim: if not FScene.LayerOn[okDim] then Continue;
+      lkCallout, lkTag: if not FScene.LayerOn[okCallout] then Continue;
+      lkTiny: if not FScene.LayerOn[okMarking] then Continue;
+    end;
     C := Ink;
     C.alpha := Round(C.alpha * L.Alpha);
     case L.Kind of
@@ -507,7 +588,7 @@ begin
           Txt(X, L.Y - TH / 2, L.Text, 12, False, C);
         end;
       lkTiny:
-        Txt(L.X, L.Y - TextH(10) / 2, L.Text, 10, False, BGRA(250, 248, 240, Round(230 * L.Alpha)), taCenter);
+        Txt(L.X, L.Y - TextH(9) / 2, L.Text, 9, False, BGRA(30, 30, 38, Round(215 * L.Alpha)), taCenter);
     end;
   end;
 end;
@@ -527,6 +608,11 @@ begin
 end;
 
 procedure TMainForm.DrawHud;
+const
+  Captions: array[0..2, 0..3] of string = (
+    ('FPS', 'CPU MS', 'RASTER MS', 'THREADS'),
+    ('PRIMS', 'BUILD MS', 'HUD MS', 'SIZE'),
+    ('OUTPUT', '', 'SHOTS', 'FOCAL'));
 var
   W, H: integer;
   B: TButtonId;
@@ -613,12 +699,23 @@ begin
   end;
   Txt(Margin + 16, FButtons[bShutter].R.Top - 18,
     'DRAG orbit · WHEEL zoom lens · CTRL+WHEEL / RIGHT DRAG distance · [ ] shutter · ' +
-    #$E2#$86#$91#$E2#$86#$93 + ' ISO · ' + #$E2#$86#$90#$E2#$86#$92 + ' aperture · F11 fullscreen',
+    #$E2#$86#$91#$E2#$86#$93 + ' ISO · ' + #$E2#$86#$90#$E2#$86#$92 + ' aperture · F11 fullscreen · F12 developer',
     11, False, InkSoft);
 
-  // title block values
+  // title block: part of the HUD so the drawing never runs over it
   TX := W - Margin - TitleW;
   TY := H - Margin - TitleH;
+  FPool.AddFill(TX, TY, W - Margin, H - Margin, BGRA(246, 244, 237, 255));
+  FPool.AddRect(TX, TY, W - Margin, H - Margin, Ink, 1.4);
+  FPool.AddLine(TX, TY + 34, W - Margin, TY + 34, Ink, 1);
+  FPool.AddLine(TX, TY + 62, W - Margin, TY + 62, InkSoft, 0.8);
+  FPool.AddLine(TX, TY + 90, W - Margin, TY + 90, InkSoft, 0.8);
+  for i := 1 to 3 do
+    FPool.AddLine(TX + TitleW * i / 4, TY + 34, TX + TitleW * i / 4, H - Margin, InkSoft, 0.8);
+  Txt(TX + 6, TY + 3, 'TITLE', 9, False, InkSoft);
+  Txt(W - Margin - 6, TY + 3, 'DWG NO. LZ-1-001', 9, False, InkSoft, taRightJustify);
+  for i := 0 to 11 do
+    Txt(TX + TitleW * (i mod 4) / 4 + 5, TY + 36 + (i div 4) * 28, Captions[i div 4, i mod 4], 9, False, InkSoft);
   Txt(TX + 6, TY + 14, 'LZ-1 CAMERA  ·  GENERAL ARRANGEMENT', 15, True, Ink);
   // numbers change every frame: they are refreshed twice a second so the text cache stays small
   for i := 0 to 6 do Cell(i mod 4, i div 4, FStats[i]);
@@ -681,6 +778,10 @@ begin
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    GLVendor := StrPas(PChar(glGetString(GL_VENDOR)));
+    GLRenderer := StrPas(PChar(glGetString(GL_RENDERER)));
+    GLVersion := StrPas(PChar(glGetString(GL_VERSION)));
+    Log('gl', GLRenderer + ' / ' + GLVersion);
     FTexW := 0;
     FGLReady := True;
     FVSyncApplied := not FVSync;
@@ -773,7 +874,10 @@ begin
         FVSync := not FVSync;
         FNextFrame := NowMs;
       end;
+    bDev: ToggleDev;
   end;
+  if B = bExplode then Audio.Play(sndWhoosh);
+  Log('input', FButtons[B].Caption);
 end;
 
 procedure TMainForm.OutMouseDown(Sender: TObject; Button: TMouseButton; Shift: TShiftState; X, Y: integer);
@@ -834,7 +938,10 @@ begin
   if ssCtrl in Shift then
     FScene.Distance := EnsureRange(FScene.Distance - WheelDelta / 120 * 2.5, 28, 90)
   else
+  begin
     FScene.ZoomTarget := EnsureRange(FScene.ZoomTarget + WheelDelta / 120 * 0.08, 0, 1);
+    Audio.Play(sndTick);
+  end;
   Handled := True;
 end;
 
@@ -857,6 +964,264 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------------ developer window support }
+
+// --devtest <dir>: drive the developer window and the exports, then quit.
+procedure TMainForm.DevTestStep;
+var
+  Dir: string;
+  T: double;
+begin
+  Dir := IncludeTrailingPathDelimiter(ParamStr(2));
+  T := FScene.Time;
+  case FTestStep of
+    0: if T > 1 then
+       begin
+         ToggleDev;
+         HoverObj := 2;
+         Inc(FTestStep);
+       end;
+    1: if (T > 1.6) and not ExportBusy then
+       begin
+         FFrame.SaveToFile(Dir + 'main_hover.png');
+         HoverObj := -1;
+         RequestStill(Dir + 'still2x.png', 2, False);
+         Inc(FTestStep);
+       end;
+    2: if (T > 2.2) and not ExportBusy then
+       begin
+         StartRecording(False, 2, 10, 0.5, False, '');
+         Inc(FTestStep);
+       end;
+    3: if not Recording and not ExportBusy and (T > 4.5) then
+       begin
+         Log('test', 'GIF result: ' + ExportStatus);
+         StartRecording(True, 3, 60, 1, True, '');
+         Inc(FTestStep);
+       end;
+    4: if not Recording and not ExportBusy then
+       begin
+         Log('test', 'MP4 result: ' + ExportStatus);
+         FScene.LayerOn[okGrid] := False;
+         FScene.LayerOn[okConstruct] := False;
+         FTestT := T;
+         Inc(FTestStep);
+       end;
+    5: if T > FTestT + 0.5 then
+       begin
+         FFrame.SaveToFile(Dir + 'main_layers_off.png');
+         HoverObj := 113;            // not a real row: must be ignored safely
+         TDevForm(Dev).SaveTabShots(Dir);
+         with TStringList.Create do
+         try
+           Text := LogTail(400);
+           SaveToFile(Dir + 'log.txt');
+         finally
+           Free;
+         end;
+         Application.Terminate;
+         Inc(FTestStep);
+       end;
+  end;
+end;
+
+procedure TMainForm.ToggleDev;
+begin
+  if Dev = nil then
+  begin
+    Dev := TDevForm.Create(Application);
+    // next to the main window when there is room, else over its right part
+    Dev.Left := Min(Left + Width + 4, Screen.Width - Dev.Width);
+    Dev.Top := Top;
+  end;
+  if Dev.Visible then Dev.Hide else Dev.Show;
+end;
+
+// Thin dashed box around the object under the mouse in the developer object list.
+procedure TMainForm.DrawHover;
+var
+  B: TRectF;
+  ObjName: string;
+  C: TBGRAPixel;
+
+  procedure Dashed(X0, Y0, X1, Y1: single);
+  var
+    L, T, DX, DY: single;
+  begin
+    DX := X1 - X0;
+    DY := Y1 - Y0;
+    L := Sqrt(DX * DX + DY * DY);
+    if L < 1 then Exit;
+    T := 0;
+    while T < L do
+    begin
+      FPool.AddLine(X0 + DX * T / L, Y0 + DY * T / L, X0 + DX * Min(L, T + 5) / L, Y0 + DY * Min(L, T + 5) / L, C, 1);
+      T := T + 9;
+    end;
+  end;
+
+begin
+  if HoverObj < 100 then
+  begin
+    if HoverObj > High(FScene.PartStats) then Exit;
+    B := FScene.PartStats[HoverObj].Box;
+    ObjName := FScene.Parts[HoverObj].Name;
+  end
+  else
+  begin
+    if HoverObj - 100 >= KindCount then Exit;
+    B := FScene.KindStats[HoverObj - 100].Box;
+    ObjName := KindNames[HoverObj - 100];
+  end;
+  if B.Right < B.Left then Exit;      // nothing of it is drawn
+  B := RectF(B.Left - 6, B.Top - 6, B.Right + 6, B.Bottom + 6);
+  C := BGRA(40, 90, 200, 220);
+  Dashed(B.Left, B.Top, B.Right, B.Top);
+  Dashed(B.Right, B.Top, B.Right, B.Bottom);
+  Dashed(B.Right, B.Bottom, B.Left, B.Bottom);
+  Dashed(B.Left, B.Bottom, B.Left, B.Top);
+  Txt(B.Left, B.Top - 16, ObjName, 11, False, C);
+end;
+
+function TMainForm.ReproCommand: string;
+var
+  Fs: TFormatSettings;
+begin
+  Fs := DefaultFormatSettings;
+  Fs.DecimalSeparator := '.';
+  Result := Format('CameraSketch.exe --shot shot.png 6 %s 0 %s %s',
+    [BoolToStr(FScene.ExplodeOn, 'explode', 'x'), FormatFloat('0.000', FScene.Yaw, Fs),
+     FormatFloat('0.000', FScene.Pitch, Fs)]);
+end;
+
+procedure TMainForm.RequestStill(const Path: string; Scale: integer; WithHud: boolean);
+begin
+  FCapPath := Path;
+  FCapScale := Max(1, Scale);
+  FCapHud := WithHud;
+end;
+
+procedure TMainForm.StartRecording(Mp4: boolean; Seconds, Fps: integer; Scale: single; WithHud: boolean;
+  const FfmpegHint: string);
+var
+  Exe: string;
+begin
+  if Recording or ExportBusy then Exit;
+  FRecMp4 := Mp4;
+  FRecFps := Max(1, Fps);
+  FRecHud := WithHud;
+  // fixed output size for the whole clip; even numbers for the video encoder
+  FRecW := Max(16, Round(FOutput.Width * Scale)) and not 1;
+  FRecH := Max(16, Round(FOutput.Height * Scale)) and not 1;
+  FRecWriter := nil;
+  FRecFrames := nil;
+  if Mp4 then
+  begin
+    Exe := FindFfmpeg(FfmpegHint);
+    if Exe <> '' then
+    begin
+      FRecPath := TimeStampName('clip_', '.mp4');
+      try
+        FRecWriter := TFfmpegWriter.Create(StartFfmpeg(Exe, FRecPath, FRecW, FRecH, FRecFps), FRecPath);
+        Log('export', 'ffmpeg: ' + Exe);
+      except
+        on E: Exception do
+        begin
+          Log('export', 'cannot start ffmpeg: ' + E.Message);
+          FRecWriter := nil;
+        end;
+      end;
+    end;
+    if FRecWriter = nil then
+    begin
+      FRecPath := ChangeFileExt(TimeStampName('clip_', '.x'), '');      // folder for the PNG sequence
+      FRecFrames := TFPList.Create;
+    end;
+  end
+  else
+  begin
+    FRecPath := TimeStampName('clip_', '.gif');
+    FRecFrames := TFPList.Create;
+  end;
+  FRecStart := NowMs;
+  FRecEnd := FRecStart + Seconds * 1000;
+  FRecNext := FRecStart;
+  Recording := True;
+  LogFmt('export', 'recording %s %d s at %d fps, %dx%d -> %s', [BoolToStr(Mp4, 'MP4', 'GIF'), Seconds, FRecFps,
+    FRecW, FRecH, FRecPath]);
+end;
+
+procedure TMainForm.CaptureFrames;
+var
+  L: TFPList;
+  B, Extra: TBGRABitmap;
+  T: double;
+  N: integer;
+begin
+  if FCapPath <> '' then
+  begin
+    if not ExportBusy then
+    begin
+      L := TFPList.Create;
+      L.Add(FFrame.Duplicate);
+      TExportThread.Create(ekStill, L, FCapPath, 1, nil);
+    end
+    else
+      Log('export', 'still skipped: an export is still being written');
+    FCapPath := '';
+  end;
+  if not Recording then Exit;
+  T := NowMs;
+  if T >= FRecNext then
+  begin
+    if (FFrame.Width = FRecW) and (FFrame.Height = FRecH) then
+      B := FFrame.Duplicate as TBGRABitmap
+    else
+      B := FFrame.Resample(FRecW, FRecH, rmFineResample) as TBGRABitmap;
+    // one clip frame per 1/fps of real time: a late loop frame fills the slots it
+    // missed, so the clip lasts as long as the recording did
+    N := 0;
+    while (T >= FRecNext) and (N < 8) do
+    begin
+      FRecNext := FRecNext + 1000 / FRecFps;
+      Inc(N);
+      if (T >= FRecNext) and (N < 8) then Extra := B.Duplicate as TBGRABitmap else Extra := B;
+      if FRecWriter <> nil then FRecWriter.Push(Extra) else FRecFrames.Add(Extra);
+    end;
+    if T >= FRecNext then FRecNext := T + 1000 / FRecFps;    // hopelessly behind: resync
+  end;
+  if T >= FRecEnd then StopRecording;
+end;
+
+procedure TMainForm.StopRecording;
+begin
+  if not Recording then Exit;
+  Recording := False;
+  if FRecWriter <> nil then
+    FRecWriter.Finish
+  else if (FRecFrames <> nil) and (FRecFrames.Count > 0) then
+  begin
+    if FRecMp4 then
+      TExportThread.Create(ekPngSeq, FRecFrames, FRecPath, FRecFps, nil)
+    else
+      TExportThread.Create(ekGif, FRecFrames, FRecPath, FRecFps, nil);
+  end
+  else
+    FreeAndNil(FRecFrames);
+  FRecWriter := nil;
+  FRecFrames := nil;
+  Log('export', 'recording stopped, encoding in the background');
+end;
+
+function TMainForm.RecordStatus: string;
+var
+  N: integer;
+begin
+  if FRecFrames <> nil then N := FRecFrames.Count else N := Round((NowMs - FRecStart) / 1000 * FRecFps);
+  Result := Format('Recording %.1f / %.1f s, %d frames, %dx%d', [(NowMs - FRecStart) / 1000,
+    (FRecEnd - FRecStart) / 1000, N, FRecW, FRecH]);
+end;
+
 procedure TMainForm.FormKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
 begin
   case Key of
@@ -867,12 +1232,21 @@ begin
     VK_L: PressButton(bLabels);
     VK_R: PressButton(bRedraw);
     VK_V: PressButton(bVSync);
-    VK_OEM_4: FScene.ShutterIdx := Max(0, FScene.ShutterIdx - 1);
-    VK_OEM_6: FScene.ShutterIdx := Min(High(ShutterNames), FScene.ShutterIdx + 1);
-    VK_UP: FScene.IsoIdx := Min(High(IsoValues), FScene.IsoIdx + 1);
-    VK_DOWN: FScene.IsoIdx := Max(0, FScene.IsoIdx - 1);
-    VK_RIGHT: FScene.ApertureIdx := Min(High(FStops), FScene.ApertureIdx + 1);
-    VK_LEFT: FScene.ApertureIdx := Max(0, FScene.ApertureIdx - 1);
+    VK_OEM_4, VK_OEM_6, VK_UP, VK_DOWN, VK_RIGHT, VK_LEFT:
+      begin
+        case Key of
+          VK_OEM_4: FScene.ShutterIdx := Max(0, FScene.ShutterIdx - 1);
+          VK_OEM_6: FScene.ShutterIdx := Min(High(ShutterNames), FScene.ShutterIdx + 1);
+          VK_UP: FScene.IsoIdx := Min(High(IsoValues), FScene.IsoIdx + 1);
+          VK_DOWN: FScene.IsoIdx := Max(0, FScene.IsoIdx - 1);
+          VK_RIGHT: FScene.ApertureIdx := Min(High(FStops), FScene.ApertureIdx + 1);
+          VK_LEFT: FScene.ApertureIdx := Max(0, FScene.ApertureIdx - 1);
+        end;
+        Audio.Play(sndDial);
+        LogFmt('input', 'exposure set to %s f/%s ISO %d', [ShutterNames[FScene.ShutterIdx],
+          FormatFloat('0.#', FStops[FScene.ApertureIdx]), IsoValues[FScene.IsoIdx]]);
+      end;
+    VK_F12: ToggleDev;
     VK_F11: ToggleFullScreen;
     VK_ESCAPE: if FFullScreen then ToggleFullScreen;
   else

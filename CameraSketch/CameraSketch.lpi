@@ -51,6 +51,26 @@
         <ResourceBaseClass Value="Form"/>
         <UnitName Value="UMain"/>
       </Unit>
+      <Unit>
+        <Filename Value="ulog.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="ULog"/>
+      </Unit>
+      <Unit>
+        <Filename Value="uaudio.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="UAudio"/>
+      </Unit>
+      <Unit>
+        <Filename Value="uexport.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="UExport"/>
+      </Unit>
+      <Unit>
+        <Filename Value="udevform.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="UDevForm"/>
+      </Unit>
     </Units>
   </ProjectOptions>
   <CompilerOptions>

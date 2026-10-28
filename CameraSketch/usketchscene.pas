@@ -37,6 +37,24 @@ const
   DecalModel = 1;
   DecalCount = 2;
 
+  // layers: every prim and label belongs to one (the developer window toggles them)
+  okGrid = 0;
+  okShadow = 1;
+  okConstruct = 2;
+  okModel = 3;
+  okDim = 4;
+  okAxis = 5;
+  okAssembly = 6;
+  okCallout = 7;
+  okMarking = 8;
+  KindCount = 9;
+  KindNames: array[0..KindCount - 1] of string = ('Ground grid', 'Shadow', 'Construction lines',
+    'Model', 'Dimensions', 'Centre axis', 'Assembly paths', 'Callouts / tags', 'Markings');
+
+  // sound events raised by the animation, consumed by the window
+  seAutofocus = 1;
+  seShutter = 2;
+
   ShutterNames: array[0..7] of string = ('1/30', '1/60', '1/125', '1/250', '1/500', '1/1000', '1/2000', '1/4000');
   IsoValues: array[0..6] of integer = (100, 200, 400, 800, 1600, 3200, 6400);
   FStops: array[0..6] of single = (2.8, 4, 5.6, 8, 11, 16, 22);
@@ -66,6 +84,8 @@ type
     Decal: integer;                  // -1 or decal texture mapped on Pts[0..3]
     Reveal: single;                  // 0..1 drawing-in progress
     Y0, Y1: single;                  // vertical extent on screen, for band culling
+    Part: smallint;                  // part index, -1 for annotation and background
+    Kind: byte;                      // layer (ok... constant)
   end;
   PPrim = ^TPrim;
 
@@ -77,6 +97,15 @@ type
     Kind: TLabelKind;
     Alpha: single;
     Align: TAlignment;
+  end;
+
+  // What the developer window shows per object (a part or a layer)
+  TObjStat = record
+    Prims: integer;
+    Box: TRectF;                     // screen bounds, empty when nothing drawn
+    DMin, DMax: single;              // depth range
+    Reveal: single;
+    Occluded: boolean;               // anchor hidden by the body (assembled view)
   end;
 
   TPartInfo = record
@@ -101,6 +130,9 @@ type
     FCosY, FSinY, FCosP, FSinP: single;
     FPivot, FCur, FLight: TVec3;
     FCurReveal, FCurBias: single;
+    FKind: byte;
+    FSupportDepth: single;           // > 0: prims are kept in front of this depth (parts standing on the top plate)
+    FOnSupport: boolean;
     FPart: integer;
     FLX, FLY: single;                // lens axis
     FBoxMin, FBoxMax: TPointF;       // screen bounds of the model
@@ -114,6 +146,8 @@ type
     function Proj(const V: TVec3): TPointF;
     function World(const P: TVec3): TVec3;     // model point + current part offset -> view space
     function Facing(const NV, PV: TVec3): single;
+    function FromView(const V: TVec3): TVec3;
+    function Occluded(const A: TVec3): boolean;
     function HatchFor(I: single; Mat: integer): integer;
     procedure BeginPart(Index: integer);
     procedure AddFace(const C: array of TVec3; Mat: integer; ADecal: integer = -1);
@@ -124,6 +158,13 @@ type
     procedure AddCylZ(Z0, Z1, R0, R1: single; Segs: integer; Ribbed: boolean; Phase: single;
       Mat: integer; Ticks: integer = 0; CapFront: boolean = True);
     procedure AddFrontElement(ZF: single);
+    procedure AddExtrudeY(const Poly: array of TPointF; Y0, Y1: single; Mat: integer;
+      CapTop, CapBottom: boolean);
+    procedure AddLoftY(const PB, PT: array of TPointF; Y0, Y1: single; Mat: integer;
+      CapTop, CapBottom: boolean);
+    procedure AddTopLabels(CX, CY, CZ, R, Phase: single; const Texts: array of string;
+      const Angles: array of single);
+    procedure AddFaceLabels(Z, R: single; const Texts: array of string; const Angles: array of single);
     procedure AddLine3D(const Pts: array of TVec3; ALayer: byte; C: TBGRAPixel; W: single; Closed: boolean);
     procedure AddDashed(const A, B: TVec3; C: TBGRAPixel; W: single; DashDot: boolean);
     procedure AddDim(const A, B, Off: TVec3; const AText: string; Reveal: single; LabelAt: single = 0.5);
@@ -133,6 +174,7 @@ type
     procedure AddCallouts;
     procedure AddRingLabels(Z, R, Phase: single; const Texts: array of string; const Angles: array of single);
     procedure SortPrims;
+    procedure ComputeStats;
     function GetPrim(Index: integer): PPrim;
     function GetLabel(Index: integer): TSceneLabel;
   public
@@ -156,6 +198,19 @@ type
     ButtonDown: single;
     Wire, ShowLabels: boolean;
     Parts: array of TPartInfo;
+    // physics / animation parameters (tunable live from the developer window)
+    TimeScale: single;               // 1 = real time
+    ExplodeK, ExplodeC: single;      // spring stiffness and damping
+    Spread: single;                  // exploded view distance
+    OrbitDamp: single;               // orbit inertia friction
+    AutoSpeed, AutoDelay: single;    // auto orbit (rad/s, idle seconds)
+    ZoomRate, FocusRate, DialRate: single;   // follow speeds
+    FlashDecay: single;
+    LayerOn: array[0..KindCount - 1] of boolean;
+    PartStats: array of TObjStat;
+    KindStats: array[0..KindCount - 1] of TObjStat;
+    SoundEvents: integer;            // seXxx bits since the window last read them
+    procedure ResetPhysics;
     constructor Create;
     destructor Destroy; override;
     procedure Update(dt: single);
@@ -177,6 +232,8 @@ const
   MatMetal = 0;
   MatRubber = 1;
   MatLeather = 2;
+  MatKnurl = 3;
+  MatTeeth = 4;                      // dial side: alternating light and dark teeth                      // light ring: the ribs do the shading
 
   PBody = 0; PTop = 1; PPrism = 2; PShoe = 3; PShutterDial = 4; PIsoDial = 5; PRelease = 6;
   PGrip = 7; PLug = 8; PMount = 9; PRear = 10; PZoom = 11; PScale = 12; PFocus = 13;
@@ -243,14 +300,83 @@ begin
   Result := Cur + (Target - Cur) * (1 - Exp(-Rate * dt));
 end;
 
+// Rounded rectangle outline in the X/Z plane, counter-clockwise seen from above.
+function RoundRectXZ(X0, Z0, X1, Z1, R: single; Seg: integer = 5): ArrayOfTPointF;
+const
+  CornerStart: array[0..3] of single = (0, 0.5 * Pi, Pi, 1.5 * Pi);
+var
+  c, i, k: integer;
+  CX, CZ, A: single;
+begin
+  SetLength(Result, 4 * (Seg + 1));
+  k := 0;
+  for c := 0 to 3 do
+  begin
+    // corners: +X+Z... walking around the outline
+    case c of
+      0: begin CX := X1 - R; CZ := Z0 + R; end;
+      1: begin CX := X1 - R; CZ := Z1 - R; end;
+      2: begin CX := X0 + R; CZ := Z1 - R; end;
+    else
+      begin CX := X0 + R; CZ := Z0 + R; end;
+    end;
+    for i := 0 to Seg do
+    begin
+      A := CornerStart[c] - 0.5 * Pi + 0.5 * Pi * i / Seg;
+      Result[k] := PointF(CX + R * Cos(A), CZ + R * Sin(A));
+      Inc(k);
+    end;
+  end;
+end;
+
+// Rectangle with cut corners in the X/Z plane.
+function ChamferRectXZ(X0, Z0, X1, Z1, C: single): ArrayOfTPointF;
+begin
+  SetLength(Result, 8);
+  Result[0] := PointF(X0 + C, Z0);
+  Result[1] := PointF(X1 - C, Z0);
+  Result[2] := PointF(X1, Z0 + C);
+  Result[3] := PointF(X1, Z1 - C);
+  Result[4] := PointF(X1 - C, Z1);
+  Result[5] := PointF(X0 + C, Z1);
+  Result[6] := PointF(X0, Z1 - C);
+  Result[7] := PointF(X0, Z0 + C);
+end;
+
+// Grip outline in the X/Z plane: straight back edge at Z0, rounded front corners.
+function GripOutline(X0, Z0, X1, Z1, R: single; Seg: integer = 6): ArrayOfTPointF;
+var
+  i, k: integer;
+  A: single;
+begin
+  SetLength(Result, 2 + 2 * (Seg + 1));
+  Result[0] := PointF(X0, Z0);
+  Result[1] := PointF(X1, Z0);
+  k := 2;
+  for i := 0 to Seg do
+  begin
+    A := 0.5 * Pi * i / Seg;
+    Result[k] := PointF(X1 - R + R * Cos(A), Z1 - R + R * Sin(A));
+    Inc(k);
+  end;
+  for i := 0 to Seg do
+  begin
+    A := 0.5 * Pi + 0.5 * Pi * i / Seg;
+    Result[k] := PointF(X0 + R + R * Cos(A), Z1 - R + R * Sin(A));
+    Inc(k);
+  end;
+end;
+
 { TCameraScene }
 
 constructor TCameraScene.Create;
+var
+  i: integer;
 
   procedure P(Index: integer; const AName: string; const AOffset, AAnchor: TVec3; ABias: single);
   begin
     Parts[Index].Name := AName;
-    Parts[Index].Offset := VMul(AOffset, 0.72);   // spread of the exploded view
+    Parts[Index].Offset := AOffset;
     Parts[Index].Anchor := AAnchor;
     Parts[Index].Bias := ABias;
   end;
@@ -260,7 +386,7 @@ begin
   FMeasure.FontName := 'Bahnschrift';
   FMeasure.FontQuality := fqFineAntialiasing;
   FLX := 0.6;
-  FLY := -0.5;
+  FLY := -0.2;
   SetLength(Parts, PartCount);
   P(PBody,        'BODY / LEATHERETTE',  V3(0, 0, 0),      V3(6.2, -2.2, 2.5), 0);
   P(PTop,         'TOP PLATE',           V3(0, 2.4, 0),    V3(6.4, 3.6, 2.5), 0);
@@ -268,17 +394,17 @@ begin
   P(PShoe,        'HOT SHOE',            V3(0, 7.4, 0),    V3(1.3, 7.9, 0.4), 0.35);
   P(PShutterDial, 'SHUTTER SPEED DIAL',  V3(0.6, 4.0, 0),  V3(6.4, 5.4, 0.2), 0.5);
   P(PIsoDial,     'ISO DIAL',            V3(-0.6, 4.0, 0), V3(-6.2, 5.8, -0.8), 0.5);
-  P(PRelease,     'SHUTTER RELEASE',     V3(-1.0, 5.8, 1.0), V3(-5.4, 5.3, 1.6), 0.6);
+  P(PRelease,     'SHUTTER RELEASE',     V3(-1.0, 5.8, 1.0), V3(-5.4, 5.3, 3.3), 0.6);
   P(PGrip,        'GRIP',                V3(-3.4, 0, 2.6), V3(-7.2, -1.0, 4.0), 0.15);
   P(PLug,         'STRAP LUG',           V3(3.0, 0, 0),    V3(8.3, 1.4, 0), 0.3);
-  P(PMount,       'BAYONET MOUNT',       V3(0, 0, 2.6),    V3(0.6, 3.0, 2.8), 0);
-  P(PRear,        'REAR BARREL',         V3(0, 0, 5.0),    V3(0.6, 2.75, 3.8), 0);
-  P(PZoom,        'ZOOM RING',           V3(0, 0, 7.6),    V3(0.6, 3.1, 6.0), 0);
-  P(PScale,       'DISTANCE SCALE',      V3(0, 0, 10.0),   V3(0.6, 2.85, 8.1), 0);
-  P(PFocus,       'FOCUS RING',          V3(0, 0, 12.4),   V3(0.6, 3.2, 9.4), 0);
-  P(PInner,       'INNER BARREL',        V3(0, 0, 14.6),   V3(0.6, 2.8, 10.8), 0);
-  P(PHood,        'FILTER RING',         V3(0, 0, 16.8),   V3(0.6, 3.45, 11.4), 0);
-  P(PFront,       'FRONT ELEMENT',       V3(0, 0, 19.4),   V3(-1.6, 1.4, 12.0), 0);
+  P(PMount,       'BAYONET MOUNT',       V3(0, 0, 2.6),    V3(0.6, 3.35, 2.75), 0);
+  P(PRear,        'REAR BARREL',         V3(0, 0, 5.0),    V3(0.6, 3.25, 3.4), 0);
+  P(PZoom,        'ZOOM RING',           V3(0, 0, 7.6),    V3(0.6, 3.55, 5.8), 0);
+  P(PScale,       'DISTANCE SCALE',      V3(0, 0, 10.0),   V3(0.6, 3.3, 8.0), 0);
+  P(PFocus,       'FOCUS RING',          V3(0, 0, 12.4),   V3(0.6, 3.6, 9.5), 0);
+  P(PInner,       'INNER BARREL',        V3(0, 0, 14.6),   V3(0.6, 3.2, 11.0), 0);
+  P(PHood,        'FILTER RING',         V3(0, 0, 16.8),   V3(0.6, 4.1, 12.3), 0);
+  P(PFront,       'FRONT ELEMENT',       V3(0, 0, 19.4),   V3(-1.9, 1.6, 12.8), 0);
   P(PLamp,        'AF ASSIST LAMP',      V3(0, 0.4, 1.8),  V3(-2.9, 1.6, 2.7), 0.4);
   P(PLensBtn,     'LENS RELEASE',        V3(1.4, -0.4, 2.0), V3(4.6, -1.6, 2.8), 0.4);
 
@@ -296,12 +422,30 @@ begin
   ZoomTarget := 0.25;
   ShotT := -1;
   ShowLabels := True;
+  ResetPhysics;
+  for i := 0 to KindCount - 1 do LayerOn[i] := True;
+  SetLength(PartStats, PartCount);
 end;
 
 destructor TCameraScene.Destroy;
 begin
   FMeasure.Free;
   inherited Destroy;
+end;
+
+procedure TCameraScene.ResetPhysics;
+begin
+  TimeScale := 1;
+  ExplodeK := 70;
+  ExplodeC := 11;
+  Spread := 0.72;
+  OrbitDamp := 3.5;
+  AutoSpeed := 0.16;
+  AutoDelay := 2.5;
+  ZoomRate := 7;
+  FocusRate := 9;
+  DialRate := 10;
+  FlashDecay := 7;
 end;
 
 procedure TCameraScene.Replay;
@@ -313,6 +457,7 @@ procedure TCameraScene.FireShutter;
 begin
   if ShotT >= 0 then Exit;
   ShotT := 0;
+  SoundEvents := SoundEvents or seAutofocus;
   // autofocus: the focus ring hunts to a new distance before the exposure
   FocusTarget := FocusTarget + (0.8 + Random * 1.4) * (1 - 2 * Random(2));
 end;
@@ -326,6 +471,7 @@ procedure TCameraScene.Update(dt: single);
 var
   Stop, A: single;
 begin
+  dt := dt * TimeScale;
   Time := Time + dt;
   RevealTime := RevealTime + dt;
   IdleTime := IdleTime + dt;
@@ -333,25 +479,25 @@ begin
   // orbit: drag inertia, then a slow automatic sway when left alone
   Yaw := Yaw + YawVel * dt;
   Pitch := Pitch + PitchVel * dt;
-  YawVel := YawVel * Exp(-3.5 * dt);
-  PitchVel := PitchVel * Exp(-3.5 * dt);
-  if AutoOrbit and (IdleTime > 2.5) then
+  YawVel := YawVel * Exp(-OrbitDamp * dt);
+  PitchVel := PitchVel * Exp(-OrbitDamp * dt);
+  if AutoOrbit and (IdleTime > AutoDelay) then
   begin
-    A := Smooth((IdleTime - 2.5) / 2);
-    Yaw := Yaw + dt * 0.16 * A;
+    A := Smooth((IdleTime - AutoDelay) / 2);
+    Yaw := Yaw + dt * AutoSpeed * A;
     Pitch := Approach(Pitch, 0.42 + 0.1 * Sin(Time * 0.35), 0.8 * A, dt);
   end;
   Pitch := EnsureRange(Pitch, 0.06, 1.25);
 
   // exploded view: under-damped spring, it overshoots a little and settles
-  A := 70 * (Ord(ExplodeOn) - Explode) - 11 * ExplodeVel;
+  A := ExplodeK * (Ord(ExplodeOn) - Explode) - ExplodeC * ExplodeVel;
   ExplodeVel := ExplodeVel + A * dt;
   Explode := Explode + ExplodeVel * dt;
 
-  Zoom := Approach(Zoom, ZoomTarget, 7, dt);
-  Focus := Approach(Focus, FocusTarget, 9, dt);
-  ShutterDial := Approach(ShutterDial, ShutterIdx * 0.5, 10, dt);
-  IsoDial := Approach(IsoDial, IsoIdx * 0.6, 10, dt);
+  Zoom := Approach(Zoom, ZoomTarget, ZoomRate, dt);
+  Focus := Approach(Focus, FocusTarget, FocusRate, dt);
+  ShutterDial := Approach(ShutterDial, ShutterIdx * 0.5, DialRate, dt);
+  IsoDial := Approach(IsoDial, IsoIdx * 0.6, DialRate, dt);
 
   // shutter sequence: press, focus, stop down, expose, reopen, release
   Stop := 2.8 / FStops[ApertureIdx];
@@ -374,6 +520,7 @@ begin
     begin
       Flash := 1;
       Inc(Shots);
+      SoundEvents := SoundEvents or seShutter;
     end;
     if ShotT > 1.1 then ShotT := -1;
   end
@@ -382,7 +529,7 @@ begin
     ButtonDown := Approach(ButtonDown, 0, 14, dt);
     Aperture := Approach(Aperture, 1, 9, dt);
   end;
-  Flash := Flash * Exp(-7 * dt);
+  Flash := Flash * Exp(-FlashDecay * dt);
   if Flash < 0.01 then Flash := 0;
 end;
 
@@ -395,6 +542,10 @@ begin
   Result := @FPrims[FCount];
   Inc(FCount);
   Result^.Layer := ALayer;
+  // parts standing on the top plate are always drawn after the plate's top face
+  // (smooth compression into [S - 1, S - 0.01): their order among themselves is kept)
+  if FOnSupport and (ALayer = 1) and (ADepth > FSupportDepth - 1) then
+    ADepth := FSupportDepth - 1 + (1 - Exp(-(ADepth - FSupportDepth + 1))) * 0.99;
   Result^.Depth := ADepth;
   Result^.Tex := TexNone;
   Result^.Edge := emNone;
@@ -407,6 +558,8 @@ begin
   Result^.SegC := GraphiteSoft;
   Result^.Decal := -1;
   Result^.Reveal := FCurReveal;
+  Result^.Part := FPart;
+  Result^.Kind := FKind;
   if Length(Result^.Pts) <> 0 then SetLength(Result^.Pts, 0);
 end;
 
@@ -512,8 +665,14 @@ begin
       if I > 0.5 then Result := TexMid
       else if I > 0.05 then Result := TexDark
       else Result := TexRubber;
+    MatKnurl:
+      if I > 0.45 then Result := TexPaper
+      else if I > 0.05 then Result := TexLight
+      else if I > -0.3 then Result := TexMid
+      else Result := TexDark;
     MatLeather:
       if I > 0.35 then Result := TexLeather
+      else if I > -0.25 then Result := TexDark
       else Result := TexRubber;
   else
     if I > 0.55 then Result := TexPaper
@@ -528,7 +687,8 @@ var
   Delay: single;
 begin
   FPart := Index;
-  FCur := VMul(Parts[Index].Offset, Explode);
+  FCur := VMul(Parts[Index].Offset, Explode * Spread);
+  FKind := okModel;
   FCurBias := Parts[Index].Bias;
   // parts are drawn in by order: body first, the lens front last
   Delay := 0.3 + Index * 0.13;
@@ -654,7 +814,11 @@ begin
       P^.EdgeW := 0.9;
     end
     else
+    begin
       P^.Tex := HatchFor(VDot(NV[i], FLight), Mat);
+      // chunky dial teeth: every other facet two hatch levels darker
+      if (Mat = MatTeeth) and Odd(i) then P^.Tex := Min(TexDark, P^.Tex + 2);
+    end;
     if Ribbed then AddSeg(P, P^.Pts[0], P^.Pts[3]);
     FinishPrim(P);
   end;
@@ -675,6 +839,22 @@ begin
           A := Phase + 2 * Pi * i / Segs;
           AddSeg(P, Proj(World(V3(CX + R * 0.62 * Cos(A), CY + H, CZ - R * 0.62 * Sin(A)))),
                     Proj(World(V3(CX + R * 0.9 * Cos(A), CY + H, CZ - R * 0.9 * Sin(A)))));
+        end;
+    if Ticks > 0 then
+      for i := 0 to Segs - 1 do
+      begin
+        A := 2 * Pi * i / Segs;
+        j := i + 1;
+        AddSeg(P, Proj(World(V3(CX + R * 0.55 * Cos(A), CY + H, CZ - R * 0.55 * Sin(A)))),
+          Proj(World(V3(CX + R * 0.55 * Cos(2 * Pi * j / Segs), CY + H, CZ - R * 0.55 * Sin(2 * Pi * j / Segs)))));
+      end;
+    if Ribbed then
+      for i := 0 to Segs - 1 do
+        if not Odd(i) then
+        begin
+          A := Phase + 2 * Pi * i / Segs;
+          AddSeg(P, Proj(World(V3(CX + R * 0.84 * Cos(A), CY + H, CZ - R * 0.84 * Sin(A)))),
+                    Proj(World(V3(CX + R * 0.98 * Cos(A), CY + H, CZ - R * 0.98 * Sin(A)))));
         end;
     FinishPrim(P);
   end;
@@ -734,7 +914,15 @@ begin
     end
     else
       P^.Tex := HatchFor(VDot(NV[i], FLight), Mat);
-    if Ribbed then AddSeg(P, P^.Pts[0], P^.Pts[3]);
+    if Ribbed then
+    begin
+      AddSeg(P, P^.Pts[0], P^.Pts[3]);
+      if Segs > 100 then
+      begin
+        P^.SegC := BGRA(30, 30, 38, 175);
+        P^.SegW := 0.9;
+      end;
+    end;
     if (Ticks > 0) and (i mod (Segs div Ticks) = 0) then
     begin
       // engraved scale: short ticks from the front rim, every fourth one long
@@ -742,6 +930,18 @@ begin
       AddSeg(P, P^.Pts[3], PointF(P^.Pts[3].X + (P^.Pts[0].X - P^.Pts[3].X) * A,
                                   P^.Pts[3].Y + (P^.Pts[0].Y - P^.Pts[3].Y) * A));
     end;
+    FinishPrim(P);
+  end;
+  FrontC := World(V3(FLX, FLY, Z0));
+  NF := RotN(V3(0, 0, -1));
+  if (Facing(NF, FrontC) > 0) and not Wire then
+  begin
+    P := NewPrim(1, FDist - FrontC.Z - FCurBias);
+    SetLength(Pts2, Segs);
+    for i := 0 to Segs - 1 do Pts2[Segs - 1 - i] := Proj(B[i]);
+    P^.Pts := Pts2;
+    P^.Edge := emAll;
+    P^.Tex := HatchFor(VDot(NF, FLight), MatMetal);
     FinishPrim(P);
   end;
   if not CapFront then Exit;
@@ -759,10 +959,12 @@ begin
   end;
 end;
 
+// Glass, inner elements, iris and reflections, inside the front ring that ends at ZF.
 procedure TCameraScene.AddFrontElement(ZF: single);
 const
   Segs = 64;
   Blades = 9;
+  RGlass = 3.65;
 var
   P: PPrim;
   C, NF: TVec3;
@@ -783,74 +985,233 @@ var
       AddSeg(Dest, Ring(Z, Rad, 2 * Pi * k / Segs), Ring(Z, Rad, 2 * Pi * (k + 1) / Segs));
   end;
 
+  procedure Arc(Z, Rad, A0, A1: single; Dest: PPrim);
+  var
+    k: integer;
+  begin
+    for k := 0 to 11 do
+      AddSeg(Dest, Ring(Z, Rad, A0 + (A1 - A0) * k / 12), Ring(Z, Rad, A0 + (A1 - A0) * (k + 1) / 12));
+  end;
+
 begin
   C := World(V3(FLX, FLY, ZF));
   NF := RotN(V3(0, 0, 1));
   if Facing(NF, C) <= 0 then Exit;
-  // glass with the recessed inner rings
+  // glass: light, with the rims of the elements behind it
   P := NewPrim(1, FDist - C.Z - FCurBias - 0.05);
   SetLength(Pts2, Segs);
-  for i := 0 to Segs - 1 do Pts2[i] := Ring(ZF, 3.25, 2 * Pi * i / Segs);
+  for i := 0 to Segs - 1 do Pts2[i] := Ring(ZF - 0.25, RGlass, 2 * Pi * i / Segs);
   P^.Pts := Pts2;
   P^.Tex := TexGlass;
   P^.Edge := emAll;
-  P^.EdgeW := 1.6;
-  P^.SegC := BGRA(150, 150, 160, 160);
+  P^.EdgeW := 1.5;
+  P^.SegC := BGRA(40, 40, 48, 150);
   P^.SegW := 0.9;
-  Circle(ZF - 0.5, 2.95, P);
-  Circle(ZF - 1.1, 2.55, P);
+  Circle(ZF - 0.25, RGlass - 0.25, P);
+  Circle(ZF - 0.7, 3.2, P);
+  Circle(ZF - 1.2, 2.75, P);
   FinishPrim(P);
 
-  // iris: blades ring, then the opening
+  // iris, deep inside: a soft dark disc and the opening
   Open := Clamp01(Aperture);
-  R := 2.35;
+  R := 2.3;
   P := NewPrim(1, FDist - C.Z - FCurBias - 0.1);
   SetLength(Pts2, Segs);
-  for i := 0 to Segs - 1 do Pts2[i] := Ring(ZF - 1.4, R, 2 * Pi * i / Segs);
+  for i := 0 to Segs - 1 do Pts2[i] := Ring(ZF - 1.7, R, 2 * Pi * i / Segs);
   P^.Pts := Pts2;
   P^.Tex := TexSolid;
-  P^.Solid := BGRA(70, 72, 80, 255);
-  P^.SegC := BGRA(150, 152, 165, 150);
+  P^.Solid := BGRA(60, 62, 72, 95);
+  P^.SegC := BGRA(40, 40, 50, 120);
   P^.SegW := 0.8;
   Rot := 0.9 * (1 - Open);
   for i := 0 to Blades - 1 do
   begin
-    // one curved line per blade, from the opening edge out to the ring
+    // one line per blade, from the opening edge out to the ring
     A := Rot + 2 * Pi * i / Blades;
-    AddSeg(P, Ring(ZF - 1.4, Max(0.05, R * 0.92 * Open), A), Ring(ZF - 1.4, R * 0.98, A + 0.9));
+    AddSeg(P, Ring(ZF - 1.7, Max(0.05, R * 0.8 * Open), A), Ring(ZF - 1.7, R * 0.98, A + 0.9));
   end;
   FinishPrim(P);
 
   P := NewPrim(1, FDist - C.Z - FCurBias - 0.15);
   SetLength(P^.Pts, Blades);
   for i := 0 to Blades - 1 do
-    P^.Pts[i] := Ring(ZF - 1.4, Max(0.04, R * 0.92 * Open), Rot + 2 * Pi * i / Blades);
+    P^.Pts[i] := Ring(ZF - 1.7, Max(0.04, R * 0.8 * Open), Rot + 2 * Pi * i / Blades);
   P^.Tex := TexSolid;
-  P^.Solid := BGRA(14, 14, 20, 255);
+  P^.Solid := BGRA(20, 20, 28, 150 + Round(80 * (1 - Open)));
   P^.Edge := emAll;
   P^.EdgeW := 0.8;
-  P^.EdgeC := BGRA(120, 120, 135, 160);
+  P^.EdgeC := BGRA(30, 30, 40, 160);
   FinishPrim(P);
 
-  // reflections: a bright arc and a soft window highlight
+  // reflections: dark crescent at the bottom right, bright window and arcs top left
   P := NewPrim(1, FDist - C.Z - FCurBias - 0.2);
-  P^.SegC := BGRA(255, 255, 255, 210);
-  P^.SegW := 2.2;
+  SetLength(P^.Pts, 24);
   for i := 0 to 11 do
   begin
-    A := 1.95 + 0.85 * i / 12;
-    AddSeg(P, Ring(ZF, 2.75, A), Ring(ZF, 2.75, A + 0.85 / 12));
+    A := -1.9 + 2.2 * i / 11;
+    P^.Pts[i] := Ring(ZF - 0.25, RGlass - 0.3, A);
+    P^.Pts[23 - i] := Ring(ZF - 0.25, RGlass - 1.0 + 0.4 * Abs(i - 5.5) / 5.5, A);
   end;
+  P^.Tex := TexSolid;
+  P^.Solid := BGRA(30, 30, 38, 120);
+  FinishPrim(P);
+
+  P := NewPrim(1, FDist - C.Z - FCurBias - 0.25);
+  P^.SegC := BGRA(255, 255, 255, 230);
+  P^.SegW := 2.4;
+  Arc(ZF - 0.25, 3.1, 1.9, 2.9, P);
+  Arc(ZF - 0.25, 2.6, 2.05, 2.6, P);
   SetLength(P^.Pts, 12);
   for i := 0 to 5 do
   begin
-    A := 2.1 + 0.55 * i / 5;
-    P^.Pts[i] := Ring(ZF - 0.5, 2.3, A);
-    P^.Pts[11 - i] := Ring(ZF - 0.5, 1.6, A);
+    A := 2.0 + 0.7 * i / 5;
+    P^.Pts[i] := Ring(ZF - 0.7, 2.35, A);
+    P^.Pts[11 - i] := Ring(ZF - 0.7, 1.45, A);
   end;
   P^.Tex := TexSolid;
-  P^.Solid := BGRA(255, 255, 255, 45);
+  P^.Solid := BGRA(255, 255, 255, 120);
   FinishPrim(P);
+
+  // engraving on the front ring
+  AddFaceLabels(ZF, 3.98, ['LAZRA', 'ZOOM', '24-70mm', '1:2.8', #$C3#$98'82', 'MACRO'],
+    [1.7, 1.15, 0.55, -0.1, -0.75, 2.45]);
+end;
+
+// Extruded prism along Y: Poly is the outline in the X/Z plane (convex).
+procedure TCameraScene.AddExtrudeY(const Poly: array of TPointF; Y0, Y1: single; Mat: integer;
+  CapTop, CapBottom: boolean);
+begin
+  AddLoftY(Poly, Poly, Y0, Y1, Mat, CapTop, CapBottom);
+end;
+
+// Loft along Y from outline PB at Y0 to outline PT at Y1 (same point count,
+// both convex in the X/Z plane). Side faces are shaded one by one like a
+// cylinder; sharp corners and the silhouette get lines along the side, the
+// rims get the top and bottom outlines.
+procedure TCameraScene.AddLoftY(const PB, PT: array of TPointF; Y0, Y1: single; Mat: integer;
+  CapTop, CapBottom: boolean);
+var
+  n, i, j, h: integer;
+  B, T, NV, NM: array of TVec3;
+  Vis: array of boolean;
+  Cx, Cz: single;
+  Ctr, NC, MB0, MB1, MT0, Mid: TVec3;
+  P: PPrim;
+  Pts2: array of TPointF;
+begin
+  n := Length(PB);
+  SetLength(B, n);
+  SetLength(T, n);
+  SetLength(NV, n);
+  SetLength(NM, n);
+  SetLength(Vis, n);
+  Cx := 0;
+  Cz := 0;
+  for i := 0 to n - 1 do
+  begin
+    Cx := Cx + (PB[i].X + PT[i].X) / (2 * n);
+    Cz := Cz + (PB[i].Y + PT[i].Y) / (2 * n);
+    B[i] := World(V3(PB[i].X, Y0, PB[i].Y));
+    T[i] := World(V3(PT[i].X, Y1, PT[i].Y));
+  end;
+  for i := 0 to n - 1 do
+  begin
+    j := (i + 1) mod n;
+    // side normal from the face itself (it leans in on a loft), pointing away from the centre
+    MB0 := V3(PB[i].X, Y0, PB[i].Y);
+    MB1 := V3(PB[j].X, Y0, PB[j].Y);
+    MT0 := V3(PT[i].X, Y1, PT[i].Y);
+    NM[i] := VNorm(VCross(VSub(MB1, MB0), VSub(MT0, MB0)));
+    Mid := VMul(VAdd(VAdd(MB0, MB1), VAdd(MT0, V3(PT[j].X, Y1, PT[j].Y))), 0.25);
+    if VDot(NM[i], VSub(Mid, V3(Cx, (Y0 + Y1) / 2, Cz))) < 0 then NM[i] := VMul(NM[i], -1);
+    NV[i] := RotN(NM[i]);
+    Ctr := VMul(VAdd(VAdd(B[i], B[j]), VAdd(T[i], T[j])), 0.25);
+    Vis[i] := Facing(NV[i], Ctr) > 0;
+  end;
+  for i := 0 to n - 1 do
+  begin
+    if not Vis[i] and not Wire then Continue;
+    j := (i + 1) mod n;
+    h := (i + n - 1) mod n;
+    Ctr := VMul(VAdd(VAdd(B[i], B[j]), VAdd(T[i], T[j])), 0.25);
+    P := NewPrim(1, FDist - Ctr.Z - FCurBias);
+    SetLength(P^.Pts, 4);
+    P^.Pts[0] := Proj(B[i]);
+    P^.Pts[1] := Proj(B[j]);
+    P^.Pts[2] := Proj(T[j]);
+    P^.Pts[3] := Proj(T[i]);
+    P^.Edge := emMask;
+    P^.EdgeMask := 1 or 4;
+    if not Vis[h] or (VDot(NM[h], NM[i]) < 0.8) then P^.EdgeMask := P^.EdgeMask or 8;
+    if not Vis[j] or (VDot(NM[j], NM[i]) < 0.8) then P^.EdgeMask := P^.EdgeMask or 2;
+    P^.Sketchy := True;
+    if Wire then
+    begin
+      P^.EdgeC := BGRA(40, 50, 70, IfThen(Vis[i], 180, 60));
+      P^.EdgeW := 0.9;
+    end
+    else
+      P^.Tex := HatchFor(VDot(NV[i], FLight), Mat);
+    FinishPrim(P);
+  end;
+  for h := 0 to 1 do
+  begin
+    if (h = 0) and not CapTop then Continue;
+    if (h = 1) and not CapBottom then Continue;
+    NC := RotN(V3(0, 1 - 2 * h, 0));
+    if h = 0 then Ctr := World(V3(Cx, Y1, Cz)) else Ctr := World(V3(Cx, Y0, Cz));
+    if (Facing(NC, Ctr) <= 0) and not Wire then Continue;
+    P := NewPrim(1, FDist - Ctr.Z - FCurBias);
+    if (h = 0) and not FOnSupport then FSupportDepth := Min(FSupportDepth, P^.Depth);
+    SetLength(Pts2, n);
+    for i := 0 to n - 1 do
+      if h = 0 then Pts2[i] := Proj(T[i]) else Pts2[i] := Proj(B[i]);
+    P^.Pts := Pts2;
+    P^.Edge := emAll;
+    if not Wire then P^.Tex := HatchFor(VDot(NC, FLight), MatMetal);
+    FinishPrim(P);
+  end;
+end;
+
+// Markings on the top of a dial (rotating with it).
+procedure TCameraScene.AddTopLabels(CX, CY, CZ, R, Phase: single; const Texts: array of string;
+  const Angles: array of single);
+var
+  i: integer;
+  A, F: single;
+  V: TVec3;
+  S: TPointF;
+begin
+  V := World(V3(CX, CY, CZ));
+  F := Facing(RotN(V3(0, 1, 0)), V) / Max(1, FDist - V.Z);
+  if F < 0.15 then Exit;
+  for i := 0 to High(Texts) do
+  begin
+    A := Phase + Angles[i];
+    // the prism or the body may stand between the eye and the dial
+    if Occluded(VAdd(V3(CX + R * Cos(A), CY, CZ - R * Sin(A)), FCur)) then Continue;
+    S := Proj(World(V3(CX + R * Cos(A), CY, CZ - R * Sin(A))));
+    AddLabel(S.X, S.Y, Texts[i], lkTiny, FCurReveal * Smooth((F - 0.15) / 0.25) * (1 - Clamp01(Explode * 3)));
+  end;
+end;
+
+// Engraving on a front-facing ring face of the lens.
+procedure TCameraScene.AddFaceLabels(Z, R: single; const Texts: array of string; const Angles: array of single);
+var
+  i: integer;
+  F: single;
+  V: TVec3;
+  S: TPointF;
+begin
+  V := World(V3(FLX, FLY, Z));
+  F := Facing(RotN(V3(0, 0, 1)), V) / Max(1, FDist - V.Z);
+  if F < 0.2 then Exit;
+  for i := 0 to High(Texts) do
+  begin
+    if Occluded(VAdd(V3(FLX + R * Cos(Angles[i]), FLY + R * Sin(Angles[i]), Z), FCur)) then Continue;
+    S := Proj(World(V3(FLX + R * Cos(Angles[i]), FLY + R * Sin(Angles[i]), Z)));
+    AddLabel(S.X, S.Y, Texts[i], lkTiny, FCurReveal * Smooth((F - 0.2) / 0.3) * (1 - Clamp01(Explode * 3)));
+  end;
 end;
 
 procedure TCameraScene.AddLine3D(const Pts: array of TVec3; ALayer: byte; C: TBGRAPixel; W: single;
@@ -958,6 +1319,8 @@ var
   X, Z, A: single;
   C: TBGRAPixel;
 begin
+  FPart := -1;
+  FKind := okGrid;
   FCur := V3(0, 0, 0);
   FCurBias := 0;
   FCurReveal := Clamp01(RevealTime / 0.8);
@@ -982,6 +1345,66 @@ begin
 end;
 
 // Hatched shadow on the ground: convex hull of the model's corners projected along the light.
+// View space -> model space (inverse pitch, inverse yaw, add the pivot).
+function TCameraScene.FromView(const V: TVec3): TVec3;
+var
+  Y, Z, X: single;
+begin
+  Y := V.Y * FCosP + V.Z * FSinP;
+  Z := -V.Y * FSinP + V.Z * FCosP;
+  X := V.X * FCosY - Z * FSinY;
+  Z := V.X * FSinY + Z * FCosY;
+  Result := VAdd(V3(X, Y, Z), FPivot);
+end;
+
+// Is the assembled point A hidden from the eye by the body, grip, prism or lens?
+// Ray / box slab tests; a point on a box surface facing the eye is not hidden.
+function TCameraScene.Occluded(const A: TVec3): boolean;
+
+  function HitsBox(const O, D: TVec3; X0, Y0, Z0, X1, Y1, Z1: single): boolean;
+  var
+    TEnter, TExit, T0, T1, T: single;
+
+    procedure Slab(O1, D1, Lo, Hi: single);
+    begin
+      if Abs(D1) < 1e-9 then
+      begin
+        if (O1 < Lo) or (O1 > Hi) then TEnter := 2;
+        Exit;
+      end;
+      T0 := (Lo - O1) / D1;
+      T1 := (Hi - O1) / D1;
+      if T0 > T1 then
+      begin
+        T := T0; T0 := T1; T1 := T;
+      end;
+      if T0 > TEnter then TEnter := T0;
+      if T1 < TExit then TExit := T1;
+    end;
+
+  begin
+    TEnter := 0;
+    TExit := 1;
+    Slab(O.X, D.X, X0, X1);
+    Slab(O.Y, D.Y, Y0, Y1);
+    Slab(O.Z, D.Z, Z0, Z1);
+    Result := (TEnter < TExit) and (TEnter < 0.985);
+  end;
+
+var
+  E, D: TVec3;
+  ZF: single;
+begin
+  E := FromView(V3(0, 0, FDist));
+  D := VSub(A, E);
+  ZF := 13.0 + 2.8 * Zoom;
+  Result := HitsBox(E, D, -7, -4.5, -2.5, 7, 4.5, 2.5) or
+    HitsBox(E, D, -6.8, -4.5, 2.5, -4.1, 4.4, 4.5) or
+    HitsBox(E, D, -2.4, 4.5, -1.6, 2.4, 7.2, 1.8) or
+    HitsBox(E, D, -2.5, 4.8, 2.4, 2.5, 5.7, 2.9) or
+    HitsBox(E, D, 0.6 - 3.5, -0.2 - 3.5, 2.5, 0.6 + 3.5, -0.2 + 3.5, ZF);
+end;
+
 procedure TCameraScene.AddShadow;
 const
   G = -4.5;
@@ -1000,6 +1423,8 @@ var
   end;
 
 begin
+  FPart := -1;
+  FKind := okShadow;
   // the light is fixed in view space; bring it back into model space
   L := FLight;
   T := L.Y * FCosP + L.Z * FSinP;              // inverse pitch
@@ -1009,7 +1434,7 @@ begin
   L.Z := L.X * FSinY + L.Z * FCosY;
   L.X := T;
   if L.Y < 0.25 then L.Y := 0.25;
-  Ext := 10.8 + 0.6 + 2.8 * Zoom + 0.9;
+  Ext := 13.0 + 2.8 * Zoom;
   Src := nil;
   SetLength(Src, 0);
   for i := 0 to 7 do
@@ -1021,7 +1446,7 @@ begin
   for i := 0 to 11 do
   begin
     SetLength(Src, Length(Src) + 1);
-    Src[High(Src)] := V3(FLX + 3.9 * Cos(i * Pi / 6), FLY + 3.9 * Sin(i * Pi / 6), Ext);
+    Src[High(Src)] := V3(FLX + 4.3 * Cos(i * Pi / 6), FLY + 4.3 * Sin(i * Pi / 6), Ext);
   end;
   n := Length(Src);
   SetLength(Pts, n);
@@ -1081,6 +1506,8 @@ var
   A, B, D: TVec3;
   P: PPrim;
 begin
+  FPart := -1;
+  FKind := okConstruct;
   FCur := V3(0, 0, 0);
   FCurBias := 0;
   FCurReveal := Clamp01((RevealTime - 0.1) / 1.2);
@@ -1114,6 +1541,7 @@ begin
     NV := RotN(V3(Cos(A), Sin(A), 0));
     F := Facing(NV, V) / Max(1, FDist - V.Z);
     if F < 0.35 then Continue;
+    if Occluded(VAdd(V3(FLX + R * Cos(A), FLY + R * Sin(A), Z), FCur)) then Continue;
     S := Proj(V);
     AddLabel(S.X, S.Y, Texts[i], lkTiny, FCurReveal * Smooth((F - 0.35) / 0.3) * (1 - Clamp01(Explode * 3)));
   end;
@@ -1137,6 +1565,8 @@ var
   Text: string;
   Kind: TLabelKind;
 begin
+  FPart := -1;
+  FKind := okCallout;
   Ex := Clamp01(Explode);
   Alpha := Max(Smooth((Ex - 0.35) / 0.4), Ord(ShowLabels) * 0.85);
   if Alpha <= 0 then Exit;
@@ -1147,7 +1577,9 @@ begin
   begin
     if (Ex < 0.3) and not (i in [PPrism, PShutterDial, PIsoDial, PRelease, PGrip, PZoom, PFocus, PFront, PLug, PMount]) then
       Continue;
-    FCur := VMul(Parts[i].Offset, Explode);
+    // assembled: no tag for a part hidden behind the camera body or lens
+    if (Ex < 0.3) and Occluded(Parts[i].Anchor) then Continue;
+    FCur := VMul(Parts[i].Offset, Explode * Spread);
     S := Proj(World(Parts[i].Anchor));
     Calls[n].A := S;
     Calls[n].Part := i;
@@ -1258,6 +1690,8 @@ var
 begin
   FCount := 0;
   FLabelCount := 0;
+  FOnSupport := False;
+  FSupportDepth := 1e9;
   Ex := Explode;
   FCx := W * 0.5;
   FCy := H * 0.52;
@@ -1276,63 +1710,103 @@ begin
   AddConstruction;
 
   First := FCount;
-  // ---- body
+  // ---- body: rounded plates and a leatherette band set back a little
   BeginPart(PBody);
-  AddBox(-7, -4.5, -2.5, 7, 2.6, 2.5, MatLeather);
+  AddExtrudeY(RoundRectXZ(-7, -2.5, 7, 2.5, 1.0), -4.5, -3.9, MatMetal, False, True);
+  AddExtrudeY(RoundRectXZ(-6.9, -2.4, 6.9, 2.4, 0.95), -3.9, 2.6, MatLeather, False, False);
   BeginPart(PTop);
-  AddBox(-7, 2.6, -2.5, 7, 4.5, 2.5, MatMetal);
+  AddExtrudeY(RoundRectXZ(-7, -2.5, 7, 2.5, 1.0), 2.6, 4.15, MatMetal, False, False);
+  AddExtrudeY(RoundRectXZ(-6.8, -2.3, 6.8, 2.3, 0.85), 4.15, 4.5, MatMetal, True, False);
+  // the top plate wraps forward over the grip as a raised deck for the shutter release
+  AddExtrudeY(GripOutline(-7.0, 2.45, -3.9, 4.7, 1.3), 2.6, 4.15, MatMetal, False, False);
+  AddExtrudeY(GripOutline(-6.8, 2.3, -4.1, 4.5, 1.15), 4.15, 4.5, MatMetal, True, False);
+  AddFace([V3(-7.0, 2.6, 1.5), V3(-7.0, 2.6, 2.45), V3(-7.0, 4.15, 2.45), V3(-7.0, 4.15, 1.5)], MatMetal);
+  FOnSupport := True;
   BeginPart(PPrism);
-  // front face (index 2) carries the brand plate
-  AddHexa([V3(-3, 4.5, 2.7), V3(3, 4.5, 2.7), V3(3, 4.5, -2.3), V3(-3, 4.5, -2.3),
-           V3(-2.1, 7.4, 1.5), V3(2.1, 7.4, 1.5), V3(2.1, 7.4, -1.3), V3(-2.1, 7.4, -1.3)], MatMetal, 2, DecalBrand);
+  // housing in three tiers with chamfered corners: an upright base, the sloping
+  // prism hood, a bevelled roof
+  AddLoftY(ChamferRectXZ(-3.0, -2.3, 3.0, 2.5, 0.45), ChamferRectXZ(-2.9, -2.2, 2.9, 2.35, 0.45),
+    4.5, 5.5, MatMetal, False, False);
+  AddLoftY(ChamferRectXZ(-2.9, -2.2, 2.9, 2.35, 0.45), ChamferRectXZ(-2.0, -1.3, 2.0, 1.35, 0.35),
+    5.5, 7.05, MatMetal, False, False);
+  AddLoftY(ChamferRectXZ(-2.0, -1.3, 2.0, 1.35, 0.35), ChamferRectXZ(-1.7, -1.05, 1.7, 1.1, 0.3),
+    7.05, 7.4, MatMetal, True, False);
+  // name plate: a ledge standing out over the lens mount, the brand on its face
+  AddHexa([V3(-2.7, 4.75, 3.0), V3(2.7, 4.75, 3.0), V3(2.7, 4.75, 2.35), V3(-2.7, 4.75, 2.35),
+           V3(-2.6, 5.75, 2.85), V3(2.6, 5.75, 2.85), V3(2.6, 5.75, 2.3), V3(-2.6, 5.75, 2.3)],
+    MatMetal, 2, DecalBrand);
+  // rubber eyecup and the viewfinder window at the back
+  AddExtrudeY(RoundRectXZ(-1.8, -3.05, 1.8, -2.15, 0.35), 5.0, 6.7, MatRubber, True, True);
+  AddBox(-1.15, 5.4, -3.12, 1.15, 6.3, -3.05, MatRubber);
   BeginPart(PShoe);
-  AddBox(-1.3, 7.4, -1.0, 1.3, 7.9, 1.0, MatMetal);
+  // hot shoe: base plate, two rails, three contacts
+  AddBox(-1.45, 7.4, -1.0, 1.45, 7.55, 1.05, MatMetal);
+  AddBox(-1.45, 7.55, -1.0, -0.95, 7.85, 1.05, MatMetal);
+  AddBox(0.95, 7.55, -1.0, 1.45, 7.85, 1.05, MatMetal);
+  AddCylY(0, 7.55, 0.1, 0.18, 0.05, 12, False, 0, MatMetal);
+  AddCylY(-0.45, 7.55, 0.45, 0.13, 0.05, 12, False, 0, MatMetal);
+  AddCylY(0.45, 7.55, 0.45, 0.13, 0.05, 12, False, 0, MatMetal);
   BeginPart(PShutterDial);
-  AddCylY(4.6, 4.5, 0.2, 1.9, 1.1, 56, True, ShutterDial, MatMetal, 8);
+  AddCylY(4.6, 4.5, 0.2, 2.2, 0.15, 64, False, 0, MatMetal);
+  AddCylY(4.6, 4.65, 0.2, 2.0, 0.95, 60, True, ShutterDial, MatTeeth, 8);
+  AddCylY(4.6, 5.6, 0.2, 0.75, 0.3, 40, True, ShutterDial, MatTeeth, 0);
+  AddTopLabels(4.6, 5.6, 0.2, 1.48, ShutterDial, ['60', '125', '250', '500', '1000', 'B'],
+    [0.9, 0.3, -0.3, -0.9, -1.5, 1.6]);
   BeginPart(PIsoDial);
-  AddCylY(-4.9, 4.5, -0.8, 1.4, 0.8, 44, True, IsoDial, MatMetal, 7);
-  AddCylY(-4.9, 5.3, -0.8, 0.85, 0.45, 32, False, IsoDial, MatMetal, 0);
+  AddCylY(-4.9, 4.5, -0.8, 1.7, 0.15, 56, False, 0, MatMetal);
+  AddCylY(-4.9, 4.65, -0.8, 1.5, 0.65, 48, True, IsoDial, MatTeeth, 7);
+  AddCylY(-4.9, 5.3, -0.8, 0.95, 0.45, 40, True, IsoDial, MatTeeth, 0);
+  AddTopLabels(-4.9, 5.3, -0.8, 1.2, IsoDial, ['100', '400', '1600'], [0.2, -0.7, -1.6]);
   BeginPart(PRelease);
-  AddCylY(-5.4, 4.5, 1.6, 0.9, 0.3, 32, True, 0, MatMetal);
-  AddCylY(-5.4, 4.8, 1.6, 0.55, 0.5 - 0.3 * ButtonDown, 28, False, 0, MatMetal);
+  AddCylY(-5.4, 4.5, 3.3, 0.95, 0.3, 40, True, 0, MatTeeth);
+  AddCylY(-5.4, 4.8, 3.3, 0.55, 0.5 - 0.3 * ButtonDown, 28, False, 0, MatMetal);
+  AddBox(-6.55, 4.5, 3.0, -6.15, 4.72, 3.6, MatMetal);        // power switch lever
+  AddCylY(-3.5, 4.5, 1.7, 0.36, 0.28, 20, False, 0, MatMetal);  // function buttons
+  AddCylY(-6.3, 4.5, 1.2, 0.32, 0.25, 20, False, 0, MatMetal);
+  FOnSupport := False;
   BeginPart(PGrip);
-  AddHexa([V3(-7.3, -4.5, 4.6), V3(-3.9, -4.5, 4.6), V3(-3.9, -4.5, 2.5), V3(-7.3, -4.5, 2.5),
-           V3(-7.1, 2.5, 4.1), V3(-4.1, 2.5, 4.1), V3(-4.1, 2.5, 2.5), V3(-7.1, 2.5, 2.5)], MatRubber);
+  // flat back against the body front, rounded towards the hand
+  AddExtrudeY(GripOutline(-6.9, 2.45, -3.9, 4.7, 1.3), -4.3, 2.6, MatRubber, False, False);
+  // the body's rounded front-left corner leaves a notch behind the grip:
+  // close it with a side panel flush with the leatherette
+  AddFace([V3(-6.9, -4.3, 1.45), V3(-6.9, -4.3, 2.45), V3(-6.9, 2.6, 2.45), V3(-6.9, 2.6, 1.45)], MatLeather);
   BeginPart(PLug);
   AddBox(7, 2.2, -0.35, 7.5, 3.2, 0.35, MatMetal);
   AddLine3D([V3(7.5, 2.7, 0), V3(8.4, 1.3, 0.7), V3(8.4, 1.3, -0.7)], 1, Graphite, 1.6, True);
+  AddLine3D([V3(8.2, 1.5, 0.5), V3(8.9, 0.2, 0.3), V3(8.9, 0.2, -0.3), V3(8.2, 1.5, -0.5)], 1, Graphite, 1.3, True);
 
-  // ---- lens
+  // ---- lens: light metal rings, the grip rings carry dense fine knurling
   BeginPart(PMount);
-  AddCylZ(2.5, 3.1, 3.55, 3.55, 48, False, 0, MatMetal, 24);
+  AddCylZ(2.5, 3.0, 3.55, 3.55, 64, False, 0, MatMetal, 32);
   BeginPart(PRear);
-  AddCylZ(3.1, 4.4, 3.25, 3.3, 48, False, 0, MatMetal);
+  AddCylZ(3.0, 3.9, 3.4, 3.45, 64, False, 0, MatMetal);
   BeginPart(PZoom);
-  AddCylZ(4.4, 7.7, 3.6, 3.6, 72, True, Zoom * 1.4, MatRubber);
-  AddRingLabels(7.4, 3.62, Zoom * 1.4, ['24', '35', '50', '70'], [1.9, 1.55, 1.2, 0.85]);
+  AddCylZ(3.9, 7.6, 3.75, 3.75, 150, True, Zoom * 1.4, MatKnurl);
+  AddRingLabels(7.35, 3.78, Zoom * 1.4, ['24', '35', '50', '70'], [1.9, 1.55, 1.2, 0.85]);
   BeginPart(PScale);
-  AddCylZ(7.7, 8.6, 3.35, 3.35, 60, False, 0, MatMetal, 30);
-  BeginPart(PFocus);
-  AddCylZ(8.6, 10.3, 3.7, 3.7, 72, True, Focus, MatRubber);
-  AddRingLabels(10.1, 3.72, Focus, [#$E2#$88#$9E, '10', '5', '3', '2', '1.5', '1', '0.8'],
+  AddCylZ(7.6, 8.4, 3.5, 3.5, 72, False, 0, MatMetal, 36);
+  AddRingLabels(8.0, 3.52, Focus, [#$E2#$88#$9E, '10', '5', '3', '2', '1.5', '1', '0.8'],
     [2.6, 2.35, 2.1, 1.85, 1.6, 1.35, 1.1, 0.85]);
+  BeginPart(PFocus);
+  AddCylZ(8.4, 10.6, 3.8, 3.8, 160, True, Focus, MatKnurl);
   BeginPart(PInner);
-  ZI := 10.3 + 0.5 + Ext;
-  AddCylZ(10.3, ZI, 3.3, 3.3, 48, False, 0, MatMetal, 0);
+  ZI := 10.6 + 0.5 + Ext;
+  AddCylZ(10.6, ZI, 3.45, 3.45, 64, False, 0, MatMetal, 0);
   BeginPart(PHood);
-  ZF := ZI + 0.9;
-  AddCylZ(ZI, ZF, 3.75, 3.95, 56, False, 0, MatMetal, 28);
+  AddCylZ(ZI, ZI + 0.7, 3.55, 4.25, 72, False, 0, MatMetal, 0, False);
+  ZF := ZI + 1.9;
+  AddCylZ(ZI + 0.7, ZF, 4.3, 4.3, 120, True, 0, MatMetal, 0);
   BeginPart(PFront);
   AddFrontElement(ZF);
 
   // ---- small round parts off the lens axis: move the axis for them
   FLX := -2.9; FLY := 1.6;
   BeginPart(PLamp);
-  AddCylZ(2.5, 2.8, 0.4, 0.35, 20, False, 0, MatMetal);
+  AddCylZ(2.4, 2.8, 0.4, 0.35, 20, False, 0, MatMetal);
   FLX := 4.6; FLY := -1.6;
   BeginPart(PLensBtn);
-  AddCylZ(2.5, 2.9, 0.55, 0.5, 20, False, 0, MatMetal);
-  FLX := 0.6; FLY := -0.5;
+  AddCylZ(2.4, 2.9, 0.6, 0.55, 24, False, 0, MatMetal);
+  FLX := 0.6; FLY := -0.2;
 
   // screen bounds of the model, for the callout layout
   FBoxMin := PointF(1e9, 1e9);
@@ -1348,29 +1822,87 @@ begin
 
   // ---- annotation
   DimR := Clamp01((RevealTime - 3.0) / 0.9) * (1 - Smooth(Ex * 2.5));
+  // the dimensions are laid out for a front view: fade them as the front turns away
+  DimR := DimR * Smooth((Facing(RotN(V3(0, 0, 1)), ToView(V3(0, 0, 2.5))) / FDist - 0.05) / 0.3);
+  FPart := -1;
+  FKind := okDim;
   if (DimR > 0) and not Wire then
   begin
     FCur := V3(0, 0, 0);
-    AddDim(V3(-7, -4.5, 2.5), V3(7, -4.5, 2.5), V3(0, -0.2, 3.2), '140', DimR, 0.18);
-    AddDim(V3(7, -4.5, -2.5), V3(7, 4.5, -2.5), V3(2.4, 0, -0.6), '90', DimR);
-    AddDim(V3(FLX, FLY - 3.95, 2.5), V3(FLX, FLY - 3.95, ZF), V3(3.4, -0.6, 0),
+    AddDim(V3(-7, 4.5, -2.5), V3(7, 4.5, -2.5), V3(0, 4.6, 0), '140', DimR, 0.3);
+    AddDim(V3(7, -4.5, -2.5), V3(7, 4.5, -2.5), V3(3.6, 0, -0.8), '90', DimR, 0.62);
+    AddDim(V3(FLX, FLY - 4.3, 2.5), V3(FLX, FLY - 4.3, ZF), V3(3.6, -0.2, 0),
       Format('%.1f', [(ZF - 2.5) * 10]), DimR);
   end;
   // lens axis as a dash-dot centre line
+  FKind := okAxis;
   FCurReveal := Clamp01((RevealTime - 2.8) / 0.6);
   if FCurReveal > 0 then
     AddDashed(V3(FLX, FLY, -4), V3(FLX, FLY, ZF + 4 + 14 * Clamp01(Ex)), Construct, 0.8, True);
   // exploded view: dashed assembly paths from each part back to its seat
+  FKind := okAssembly;
   if Ex > 0.05 then
   begin
     FCurReveal := Clamp01(Ex);
     for i := 0 to PartCount - 1 do
       if (Parts[i].Offset.X <> 0) or (Parts[i].Offset.Y <> 0) then
-        AddDashed(Parts[i].Anchor, VAdd(Parts[i].Anchor, VMul(Parts[i].Offset, Ex)),
+        AddDashed(Parts[i].Anchor, VAdd(Parts[i].Anchor, VMul(Parts[i].Offset, Ex * Spread)),
           BGRA(80, 95, 125, Round(150 * Clamp01(Ex))), 0.8, False);
   end;
   AddCallouts;
   SortPrims;
+  ComputeStats;
+end;
+
+// Per part and per layer: prim count, screen bounds, depth range, reveal.
+procedure TCameraScene.ComputeStats;
+
+  procedure Clear(var S: TObjStat);
+  begin
+    S.Prims := 0;
+    S.Box := RectF(1e9, 1e9, -1e9, -1e9);
+    S.DMin := 1e9;
+    S.DMax := -1e9;
+    S.Reveal := 0;
+    S.Occluded := False;
+  end;
+
+  procedure Add(var S: TObjStat; const P: TPrim);
+  var
+    k: integer;
+
+    procedure Pt(const Q: TPointF);
+    begin
+      if Q.X < S.Box.Left then S.Box.Left := Q.X;
+      if Q.Y < S.Box.Top then S.Box.Top := Q.Y;
+      if Q.X > S.Box.Right then S.Box.Right := Q.X;
+      if Q.Y > S.Box.Bottom then S.Box.Bottom := Q.Y;
+    end;
+
+  begin
+    Inc(S.Prims);
+    for k := 0 to High(P.Pts) do Pt(P.Pts[k]);
+    for k := 0 to P.NSeg - 1 do Pt(P.Segs[k]);
+    if P.Layer = 1 then
+    begin
+      S.DMin := Min(S.DMin, P.Depth);
+      S.DMax := Max(S.DMax, P.Depth);
+    end;
+    S.Reveal := Max(S.Reveal, P.Reveal);
+  end;
+
+var
+  i: integer;
+begin
+  for i := 0 to PartCount - 1 do Clear(PartStats[i]);
+  for i := 0 to KindCount - 1 do Clear(KindStats[i]);
+  for i := 0 to FCount - 1 do
+  begin
+    if FPrims[i].Part >= 0 then Add(PartStats[FPrims[i].Part], FPrims[i]);
+    Add(KindStats[FPrims[i].Kind], FPrims[i]);
+  end;
+  if Explode < 0.3 then
+    for i := 0 to PartCount - 1 do PartStats[i].Occluded := Occluded(Parts[i].Anchor);
 end;
 
 initialization
